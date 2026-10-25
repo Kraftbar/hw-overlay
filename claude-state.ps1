@@ -61,8 +61,12 @@ try {
             Set-Content -Path $file -Encoding utf8NoBOM -Value @($State, $folder, $prompt, $title)
         }
         'end' {
-            Remove-Item -Force -ErrorAction SilentlyContinue $file, $ask
+            # The desktop app ends a session's process once its turn is done,
+            # even while it waits for an answer, so only forget sessions that
+            # aren't waiting on the user.
             Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $agents "$sid.*")
+            $waiting = (Test-Path $ask) -or ((Test-Path $file) -and (Get-Content $file -TotalCount 1) -eq 'needs')
+            if (-not $waiting) { Remove-Item -Force -ErrorAction SilentlyContinue $file, $ask }
         }
         'agent-start' {
             $aid = ($in.agent_id -replace '[^\w-]', '')
