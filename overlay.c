@@ -496,7 +496,22 @@ static const char WEB_PAGE[] =
     ".r{display:flex;justify-content:space-between;padding:6px 4px;border-bottom:1px solid #222}"
     ".r span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px}"
     ".v{font-weight:bold;white-space:nowrap}.h{color:#888;font-size:13px;margin:16px 4px 2px}#e{color:#f55;padding:8px 4px}"
-    "</style></head><body><div id=m></div><div id=e></div><script>"
+    "#k{width:100%;margin:0 0 8px;padding:10px;background:#222;color:#ddd;border:1px solid #333;border-radius:6px;font:inherit}"
+    "#k.on{color:#50e678}"
+    "</style></head><body><button id=k hidden>Keep screen on</button><div id=m></div><div id=e></div><script>"
+    /* Keep the phone awake with the Wake Lock API. Chrome only offers it on
+       secure origins, so the button only shows where it can work: over HTTPS,
+       on localhost, or with this address allowed in chrome://flags. Needs a
+       tap to start and is re-armed when the page is shown again. */
+    "let lock=null,want=false;"
+    "if(navigator.wakeLock)k.hidden=false;"
+    "async function awake(){if(!want||lock)return;try{"
+    "lock=await navigator.wakeLock.request('screen');lock.onrelease=()=>{lock=null};"
+    "k.textContent='Screen stays on';k.classList.add('on')}"
+    "catch(x){want=false;k.textContent='Keep screen on (failed, tap again)'}}"
+    "k.onclick=()=>{want=!want;if(want)awake();else{lock&&lock.release();lock=null;"
+    "k.textContent='Keep screen on';k.classList.remove('on')}};"
+    "document.addEventListener('visibilitychange',()=>{if(document.visibilityState=='visible')awake()});"
     "const G='#50e678',Y='#f0d23c',R='#ff5050',F='#78c8ff',C='#e68c5a',I='#969696';"
     "const load=p=>p<60?G:p<85?Y:R,temp=c=>c<60?G:c<80?Y:R;"
     "const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));"
@@ -661,11 +676,19 @@ static DWORD WINAPI web_server(LPVOID unused)
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
         n = recv(c, req, sizeof req - 1, 0);
         if (n > 0) {
+            /* Path without any "?query": "GET /data.json?x HTTP/1.1" -> "/data.json" */
+            char *path = req + 4;
             req[n] = 0;
-            if (strncmp(req, "GET /data.json", 14) == 0) {
+            if (strncmp(req, "GET ", 4) == 0)
+                path[strcspn(path, " ?")] = 0;
+            else
+                path = NULL;
+            if (!path) {
+                web_send(c, "405 Method Not Allowed", "text/plain", "", 0);
+            } else if (strcmp(path, "/data.json") == 0) {
                 build_json(&json);
                 web_send(c, "200 OK", "application/json", json.d, json.n);
-            } else if (strncmp(req, "GET / ", 6) == 0) {
+            } else if (strcmp(path, "/") == 0) {
                 web_send(c, "200 OK", "text/html; charset=utf-8", WEB_PAGE, sizeof WEB_PAGE - 1);
             } else {
                 web_send(c, "404 Not Found", "text/plain", "", 0);
