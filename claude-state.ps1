@@ -3,10 +3,25 @@
 # "needs" = waiting for the user (permission prompt or question).
 # Hook input JSON arrives on stdin. Never fails the hook.
 #
-# Session file, one line each: state, project folder name, latest prompt.
-# System messages (task notifications etc. start with "<") are not prompts,
-# and the desktop app's throwaway "scratch-..." folders are left out.
+# Session file, one line each: state, project folder name, latest prompt,
+# session title. System messages (task notifications etc. start with "<")
+# are not prompts, and the desktop app's throwaway "scratch-..." folders are
+# left out.
 param([string]$State)
+
+# The session's title as the app shows it: the last "custom-title" entry in
+# its transcript. Only the end of the file is read; transcripts get large.
+function Get-SessionTitle([string]$path) {
+    if (-not $path -or -not (Test-Path $path)) { return '' }
+    $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $fs.Seek([Math]::Max(0, $fs.Length - 262144), 'Begin') | Out-Null
+        $tail = (New-Object IO.StreamReader($fs)).ReadToEnd()
+    } finally { $fs.Dispose() }
+    $m = [regex]::Matches($tail, '"customTitle":("(?:[^"\\]|\\.)*")')
+    if ($m.Count) { return ($m[$m.Count - 1].Groups[1].Value | ConvertFrom-Json) }
+    return ''
+}
 try {
     $in = [Console]::In.ReadToEnd() | ConvertFrom-Json
     $root = Join-Path $env:USERPROFILE '.claude\hw-overlay'
@@ -34,7 +49,9 @@ try {
             if ($new -and -not $new.StartsWith('<')) {
                 $prompt = if ($new.Length -gt 60) { $new.Substring(0, 60) + '...' } else { $new }
             }
-            Set-Content -Path $file -Encoding utf8NoBOM -Value @($State, $folder, $prompt)
+            $title = Get-SessionTitle $in.transcript_path
+            if (-not $title -and $old.Count -gt 3) { $title = $old[3] }
+            Set-Content -Path $file -Encoding utf8NoBOM -Value @($State, $folder, $prompt, $title)
         }
         'end' {
             Remove-Item -Force -ErrorAction SilentlyContinue $file

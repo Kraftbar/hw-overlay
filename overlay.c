@@ -327,7 +327,7 @@ static void gpu_sample(Snapshot *s)
 /* ------------------------------------------------- Claude Code sessions */
 
 /* claude-state.ps1, run from Claude Code hooks, keeps one file per session
-   (lines: "working"/"idle", project folder, first prompt) and one per running
+   (lines: state, project folder, latest prompt, title) and one per running
    subagent or background task under this folder. Files that stop being
    updated (crashed or interrupted sessions) expire. */
 static wchar_t g_claude_dir[MAX_PATH];
@@ -342,8 +342,8 @@ static ULONGLONG file_age_s(const WIN32_FIND_DATAW *fd)
     return (ft_to_u64(now) - ft_to_u64(fd->ftLastWriteTime)) / 10000000ULL;
 }
 
-/* Read a small UTF-8 text file into wide lines (up to 3). */
-static int read_lines(const wchar_t *path, wchar_t lines[3][128])
+/* Read a small UTF-8 text file into wide lines (up to 4). */
+static int read_lines(const wchar_t *path, wchar_t lines[4][128])
 {
     char buf[512];
     wchar_t wide[512], *p = wide, *e, c;
@@ -353,7 +353,7 @@ static int read_lines(const wchar_t *path, wchar_t lines[3][128])
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            NULL, OPEN_EXISTING, 0, NULL);
 
-    lines[0][0] = lines[1][0] = lines[2][0] = 0;
+    lines[0][0] = lines[1][0] = lines[2][0] = lines[3][0] = 0;
     if (f == INVALID_HANDLE_VALUE) return 0;
     ReadFile(f, buf, sizeof buf - 1, &got, NULL);
     CloseHandle(f);
@@ -361,7 +361,7 @@ static int read_lines(const wchar_t *path, wchar_t lines[3][128])
     wide[len] = 0;
 
     /* Split on CRLF or LF, keeping empty lines in place. */
-    while (n < 3) {
+    while (n < 4) {
         e = wcspbrk(p, L"\r\n");
         c = e ? *e : 0;
         if (e) *e = 0;
@@ -375,7 +375,7 @@ static int read_lines(const wchar_t *path, wchar_t lines[3][128])
 
 static void claude_sample(Snapshot *s)
 {
-    wchar_t pat[MAX_PATH], path[MAX_PATH], lines[3][128];
+    wchar_t pat[MAX_PATH], path[MAX_PATH], lines[4][128];
     WIN32_FIND_DATAW fd;
     HANDLE h;
     int i;
@@ -409,7 +409,9 @@ static void claude_sample(Snapshot *s)
             cs->state = state;
             cs->agents = cs->njobs = 0;
             wcsncpy_s(cs->sid, 40, fd.cFileName, _TRUNCATE);
-            if (lines[1][0] && lines[2][0])
+            if (lines[3][0])                                /* the app's title */
+                wcsncpy_s(cs->label, 128, lines[3], _TRUNCATE);
+            else if (lines[1][0] && lines[2][0])
                 swprintf(cs->label, 128, L"%s: %s", lines[1], lines[2]);
             else if (lines[1][0] || lines[2][0])
                 wcsncpy_s(cs->label, 128, lines[1][0] ? lines[1] : lines[2], _TRUNCATE);
