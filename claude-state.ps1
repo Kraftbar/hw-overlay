@@ -33,6 +33,13 @@ try {
     if (-not $sid) { exit 0 }
     $file = Join-Path $sessions $sid
 
+    # A turn that ended by asking the user something (the desktop app's
+    # next-step box) leaves a flag in asks\; until the next prompt the
+    # session counts as "needs" rather than idle.
+    $ask = Join-Path $root "asks\$sid"
+    if ($State -eq 'working') { Remove-Item -Force -ErrorAction SilentlyContinue $ask }
+    elseif ($State -eq 'idle' -and (Test-Path $ask)) { $State = 'needs' }
+
     # A finished background task comes back as a <task-notification> prompt
     # naming the tool call that started it.
     if ($in.prompt -match '<tool-use-id>([\w-]+)</tool-use-id>') {
@@ -54,7 +61,7 @@ try {
             Set-Content -Path $file -Encoding utf8NoBOM -Value @($State, $folder, $prompt, $title)
         }
         'end' {
-            Remove-Item -Force -ErrorAction SilentlyContinue $file
+            Remove-Item -Force -ErrorAction SilentlyContinue $file, $ask
             Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $agents "$sid.*")
         }
         'agent-start' {
