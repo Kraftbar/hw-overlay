@@ -506,7 +506,7 @@ static const char WEB_PAGE[] =
     "<title>hw-overlay</title><style>"
     "body{margin:0;background:#111;color:#ddd;font:16px/1.4 ui-monospace,Consolas,monospace;padding:12px}"
     ".r{display:flex;justify-content:space-between;padding:6px 4px;border-bottom:1px solid #222}"
-    ".r span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px}"
+    ".r>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px}"
     ".v{font-weight:bold;white-space:nowrap}.h{color:#888;font-size:13px;margin:16px 4px 2px}#e{color:#f55;padding:8px 4px}"
     "#k,#s{width:100%;margin:0 0 8px;padding:10px;background:#222;color:#ddd;border:1px solid #333;border-radius:6px;font:inherit}"
     ".j{color:#999;font-size:14px;padding-left:20px}"
@@ -546,12 +546,12 @@ static const char WEB_PAGE[] =
     "?row(esc(s.label),s.value+'\xC2\xB0\x43',temp(s.value)):row(esc(s.label),s.value+' rpm',F);"
     "if(d.claude){const c=d.claude;"
     "const n=(v,w,col)=>`<span style='color:${col}'>${v} ${w}</span>`;"
-    "h+='<div class=h>Claude</div>'+row('Active '+(c.busy+c.bg),"
+    "h+='<div class=h>Claude</div>'+row('Active '+n(c.busy+c.bg,'',c.busy+c.bg?C:I),"
     "n(c.busy,'busy',C)+' / '+(c.bg?n(c.bg,'bg',Y)+' / ':'')+n(c.idle,'idle',I),I);"
-    "for(const s of c.sessions){h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
+    "for(const s of c.sessions){if(s.state=='idle')continue;h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
     "s.state=='busy'?C:s.state=='bg'?Y:I);"
     "for(const j of s.jobs||[])h+=`<div class='r j'><span>\xE2\x80\xA2 ${esc(j)}</span></div>`}"
-    "h+=row('Background',c.background,c.background?C:I);}"
+    "}"
     "m.innerHTML=h;e.textContent=''}catch(x){e.textContent='PC not reachable'}}"
     "tick();setInterval(tick,1000)"
     "</script></body></html>";
@@ -760,14 +760,15 @@ static int session_rows(const Snapshot *s)
 {
     int i, n = 0;
     for (i = 0; i < s->nclaude; i++)
-        n += 1 + s->claude[i].njobs;
+        if (s->claude[i].state != CS_IDLE)
+            n += 1 + s->claude[i].njobs;
     return n < MAX_SESSION_ROWS ? n : MAX_SESSION_ROWS;
 }
 
 static int line_count(const Snapshot *s)
 {
     return 2 + (s->gpu_ok ? 1 : 0) + s->nsens +
-           (s->claude_ok ? 2 + session_rows(s) : 0);
+           (s->claude_ok ? 1 + session_rows(s) : 0);
 }
 
 static void draw_row(HDC hdc, int row, const wchar_t *label, const wchar_t *value, COLORREF col)
@@ -849,8 +850,13 @@ static void paint(HWND hwnd)
             count[CS_IDLE] = s.claude_idle;
             count[CS_BG] = s.claude_bg;
             count[CS_BUSY] = s.claude_busy;
-            swprintf(part[0], 24, L"Active %d", s.claude_busy + s.claude_bg);   /* doing something */
-            draw_row(hdc, row++, part[0], L"", IDLE_COLOR);
+            /* "Active N": how many are doing something, N in orange when > 0 */
+            draw_row(hdc, row++, L"Active", L"", IDLE_COLOR);
+            GetTextExtentPoint32W(hdc, L"Active ", 7, &sz);
+            swprintf(part[0], 24, L"%d", s.claude_busy + s.claude_bg);
+            SetTextColor(hdc, s.claude_busy + s.claude_bg ? CLAUDE_COLOR : IDLE_COLOR);
+            SetTextAlign(hdc, TA_LEFT);
+            TextOutW(hdc, 10 + sz.cx, y, part[0], (int)wcslen(part[0]));
             SetTextAlign(hdc, TA_RIGHT);
             for (st = CS_IDLE; st <= CS_BUSY; st++) {      /* drawn right to left */
                 if (st == CS_BG && !count[CS_BG]) continue;
@@ -868,12 +874,12 @@ static void paint(HWND hwnd)
             }
         }
 
-        /* One row per session (busy, then bg, then idle), each followed by
-           what it is running. */
+        /* One row per active session (busy, then bg), each followed by
+           what it is running. Idle ones are only counted. */
         {
             int st, j, shown = 0;
             wchar_t label[140];
-            for (st = CS_BUSY; st >= CS_IDLE; st--) {
+            for (st = CS_BUSY; st > CS_IDLE; st--) {
                 for (i = 0; i < s.nclaude && shown < MAX_SESSION_ROWS; i++) {
                     const ClaudeSession *cs = &s.claude[i];
                     if (cs->state != st) continue;
@@ -891,9 +897,6 @@ static void paint(HWND hwnd)
                 }
             }
         }
-
-        swprintf(buf, 64, L"%d", s.claude_agents);
-        draw_row(hdc, row++, L"Background", buf, s.claude_agents ? CLAUDE_COLOR : IDLE_COLOR);
     }
     EndPaint(hwnd, &ps);
 }
