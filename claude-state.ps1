@@ -1,6 +1,8 @@
 # Claude Code hook: records session/subagent state for hw-overlay.
 # Usage (from a hook): pwsh -NoProfile -File claude-state.ps1 <working|idle|end|agent-start|agent-stop>
 # Hook input JSON arrives on stdin. Never fails the hook.
+#
+# Session file, one line each: state, project folder name, first prompt.
 param([string]$State)
 try {
     $in = [Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -11,12 +13,21 @@ try {
 
     $sid = ($in.session_id -replace '[^\w-]', '')
     if (-not $sid) { exit 0 }
+    $file = Join-Path $sessions $sid
 
     switch ($State) {
-        'working' { Set-Content -NoNewline -Path (Join-Path $sessions $sid) -Value 'working' }
-        'idle'    { Set-Content -NoNewline -Path (Join-Path $sessions $sid) -Value 'idle' }
-        'end'     {
-            Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $sessions $sid)
+        { $_ -in 'working', 'idle' } {
+            $old = @(if (Test-Path $file) { Get-Content $file -Encoding utf8 })
+            $folder = if ($in.cwd) { Split-Path $in.cwd -Leaf } elseif ($old.Count -gt 1) { $old[1] } else { '' }
+            $prompt = if ($old.Count -gt 2 -and $old[2]) { $old[2] } else { '' }
+            if (-not $prompt -and $in.prompt) {
+                $prompt = ($in.prompt -replace '\s+', ' ').Trim()
+                if ($prompt.Length -gt 60) { $prompt = $prompt.Substring(0, 60) + '...' }
+            }
+            Set-Content -Path $file -Encoding utf8NoBOM -Value @($State, $folder, $prompt)
+        }
+        'end' {
+            Remove-Item -Force -ErrorAction SilentlyContinue $file
             Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $agents "$sid.*")
         }
         'agent-start' {

@@ -12,7 +12,8 @@
  * Hotkeys:  Ctrl+Alt+O  show/hide overlay
  *           Ctrl+Alt+Q  quit
  * Tray icon: shows CPU load %; hover for all stats, left-click to
- *            show/hide the overlay, right-click for a menu.
+ *            show/hide the overlay, right-click for a menu that also lists
+ *            the Claude sessions and whether each is busy or idle.
  */
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
@@ -34,6 +35,7 @@
 #define WM_APP_TRAY  (WM_APP + 2)
 #define IDM_TOGGLE   100
 #define IDM_QUIT     101
+#define IDM_SESSION  102                /* session rows; clicking does nothing */
 
 enum { KIND_TEMP = 1, KIND_FAN = 2 };   /* ASUSHW sensor "Type" values */
 
@@ -42,6 +44,15 @@ typedef struct {
     int kind;
     int value;
 } Sensor;
+
+#define MAX_CLAUDE   16
+
+typedef struct {
+    wchar_t sid[40];
+    wchar_t label[128];                 /* "folder: first prompt" */
+    int busy;
+    int agents;
+} ClaudeSession;
 
 typedef struct {
     double cpu;
@@ -54,6 +65,8 @@ typedef struct {
     Sensor sens[MAX_SENS];
     int claude_ok;                      /* hook state folder exists */
     int claude_busy, claude_idle, claude_agents;
+    int nclaude;
+    ClaudeSession claude[MAX_CLAUDE];
 } Snapshot;
 
 static Snapshot g_snap;                 /* guarded by g_lock */
@@ -299,8 +312,10 @@ static void gpu_sample(Snapshot *s)
 /* ------------------------------------------------- Claude Code sessions */
 
 /* claude-state.ps1, run from Claude Code hooks, keeps one file per session
-   ("working" or "idle") and one per running subagent under this folder.
-   Files that stop being updated (crashed or interrupted sessions) expire. */
+   (lines: "working"/"idle", project folder, first prompt) and one per running
+   subagent under this folder. Files that stop being updated (crashed or
+   interrupted sessions) expire. Idle sessions that never got a prompt are
+   background helpers and are not counted. */
 static wchar_t g_claude_dir[MAX_PATH];
 
 #define BUSY_EXPIRE_S   (2 * 3600)
@@ -313,50 +328,94 @@ static ULONGLONG file_age_s(const WIN32_FIND_DATAW *fd)
     return (ft_to_u64(now) - ft_to_u64(fd->ftLastWriteTime)) / 10000000ULL;
 }
 
-static int file_says_working(const wchar_t *path)
+/* Read a small UTF-8 text file into wide lines (up to 3). */
+static int read_lines(const wchar_t *path, wchar_t lines[3][128])
 {
-    char buf[8] = {0};
+    char buf[512];
+    wchar_t wide[512], *p = wide, *e, c;
     DWORD got = 0;
+    int n = 0, len;
     HANDLE f = CreateFileW(path, GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            NULL, OPEN_EXISTING, 0, NULL);
+
+    lines[0][0] = lines[1][0] = lines[2][0] = 0;
     if (f == INVALID_HANDLE_VALUE) return 0;
-    ReadFile(f, buf, 7, &got, NULL);
+    ReadFile(f, buf, sizeof buf - 1, &got, NULL);
     CloseHandle(f);
-    return strncmp(buf, "working", 7) == 0;
+    len = MultiByteToWideChar(CP_UTF8, 0, buf, (int)got, wide, 511);
+    wide[len] = 0;
+
+    /* Split on CRLF or LF, keeping empty lines in place. */
+    while (n < 3) {
+        e = wcspbrk(p, L"\r\n");
+        c = e ? *e : 0;
+        if (e) *e = 0;
+        wcsncpy_s(lines[n++], 128, p, _TRUNCATE);
+        if (!e) break;
+        p = e + 1;
+        if (c == L'\r' && *p == L'\n') p++;
+    }
+    return n;
 }
 
 static void claude_sample(Snapshot *s)
 {
-    wchar_t pat[MAX_PATH], path[MAX_PATH];
+    wchar_t pat[MAX_PATH], path[MAX_PATH], lines[3][128];
     WIN32_FIND_DATAW fd;
     HANDLE h;
+    int i;
 
     s->claude_busy = s->claude_idle = s->claude_agents = 0;
+    s->nclaude = 0;
 
     swprintf(pat, MAX_PATH, L"%s\\sessions\\*", g_claude_dir);
     h = FindFirstFileW(pat, &fd);
     s->claude_ok = h != INVALID_HANDLE_VALUE;
     if (h != INVALID_HANDLE_VALUE) {
         do {
+            int busy;
+            ClaudeSession *cs;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             swprintf(path, MAX_PATH, L"%s\\sessions\\%s", g_claude_dir, fd.cFileName);
-            if (file_says_working(path)) {
-                if (file_age_s(&fd) < BUSY_EXPIRE_S) s->claude_busy++;
-            } else if (file_age_s(&fd) < IDLE_EXPIRE_S) {
+            read_lines(path, lines);
+            busy = wcscmp(lines[0], L"working") == 0;
+            if (busy) {
+                if (file_age_s(&fd) >= BUSY_EXPIRE_S) continue;
+                s->claude_busy++;
+            } else {
+                if (file_age_s(&fd) >= IDLE_EXPIRE_S || !lines[2][0]) continue;
                 s->claude_idle++;
             }
+            if (s->nclaude >= MAX_CLAUDE) continue;
+            cs = &s->claude[s->nclaude++];
+            cs->busy = busy;
+            cs->agents = 0;
+            wcsncpy_s(cs->sid, 40, fd.cFileName, _TRUNCATE);
+            if (lines[1][0] && lines[2][0])
+                swprintf(cs->label, 128, L"%s: %s", lines[1], lines[2]);
+            else if (lines[1][0] || lines[2][0])
+                wcsncpy_s(cs->label, 128, lines[1][0] ? lines[1] : lines[2], _TRUNCATE);
+            else
+                wcscpy_s(cs->label, 128, L"(no prompt yet)");
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
 
+    /* Agent files are named "<session id>.<agent id>". */
     swprintf(pat, MAX_PATH, L"%s\\agents\\*", g_claude_dir);
     h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                file_age_s(&fd) < BUSY_EXPIRE_S)
-                s->claude_agents++;
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                file_age_s(&fd) >= BUSY_EXPIRE_S)
+                continue;
+            s->claude_agents++;
+            for (i = 0; i < s->nclaude; i++) {
+                size_t n = wcslen(s->claude[i].sid);
+                if (wcsncmp(fd.cFileName, s->claude[i].sid, n) == 0 && fd.cFileName[n] == L'.')
+                    s->claude[i].agents++;
+            }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -612,10 +671,54 @@ static void toggle_overlay(HWND hwnd)
     ShowWindow(hwnd, IsWindowVisible(hwnd) ? SW_HIDE : SW_SHOWNOACTIVATE);
 }
 
+/* Copy src to dst, doubling '&' so menus don't treat it as a mnemonic. */
+static void menu_escape(wchar_t *dst, size_t cap, const wchar_t *src)
+{
+    size_t n = 0;
+    for (; *src && n + 2 < cap; src++) {
+        if (*src == L'&') dst[n++] = L'&';
+        dst[n++] = *src;
+    }
+    dst[n] = 0;
+}
+
+/* One line per Claude session, busy ones first. */
+static void add_claude_items(HMENU m)
+{
+    Snapshot s;
+    wchar_t esc[256], item[320];
+    int pass, i, any = 0;
+
+    EnterCriticalSection(&g_lock);
+    s = g_snap;
+    LeaveCriticalSection(&g_lock);
+    if (!s.claude_ok) return;
+
+    AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"Claude sessions");
+    for (pass = 1; pass >= 0; pass--) {
+        for (i = 0; i < s.nclaude; i++) {
+            const ClaudeSession *cs = &s.claude[i];
+            if (cs->busy != pass) continue;
+            menu_escape(esc, 256, cs->label);
+            if (cs->agents)
+                swprintf(item, 320, L"%s\t%s  +%d subagent%s", esc,
+                         cs->busy ? L"busy" : L"idle", cs->agents, cs->agents > 1 ? L"s" : L"");
+            else
+                swprintf(item, 320, L"%s\t%s", esc, cs->busy ? L"busy" : L"idle");
+            AppendMenuW(m, MF_STRING | (cs->busy ? MF_CHECKED : 0), IDM_SESSION, item);
+            any = 1;
+        }
+    }
+    if (!any)
+        AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"(none)");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+}
+
 static void tray_menu(HWND hwnd)
 {
     HMENU m = CreatePopupMenu();
     POINT pt;
+    add_claude_items(m);
     AppendMenuW(m, MF_STRING, IDM_TOGGLE,
                 IsWindowVisible(hwnd) ? L"Hide overlay\tCtrl+Alt+O" : L"Show overlay\tCtrl+Alt+O");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
