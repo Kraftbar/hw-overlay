@@ -5,12 +5,13 @@
  *   CPU load / RAM     GetSystemTimes, GlobalMemoryStatusEx
  *   Temps / fan RPM    ASUS BIOS WMI interface (root\WMI ASUSHW) - needs admin
  *   GPU                NVIDIA NVML (nvml.dll ships with the driver)
+ *   Claude sessions    state files written by claude-state.ps1 hooks
  *
  * Build:  build.bat   (embeds a "run as administrator" manifest)
  *
  * Hotkeys:  Ctrl+Alt+O  show/hide overlay
  *           Ctrl+Alt+Q  quit
- * Tray icon: shows CPU temperature; hover for all stats, left-click to
+ * Tray icon: shows CPU load %; hover for all stats, left-click to
  *            show/hide the overlay, right-click for a menu.
  */
 #define WIN32_LEAN_AND_MEAN
@@ -21,7 +22,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define WIN_W        280
+#define WIN_W        300
 #define LINE_H       26
 #define PAD          8
 #define MARGIN       10
@@ -51,6 +52,8 @@ typedef struct {
     unsigned gpu_temp, gpu_load, gpu_fan;
     int nsens;
     Sensor sens[MAX_SENS];
+    int claude_ok;                      /* hook state folder exists */
+    int claude_busy, claude_idle, claude_agents;
 } Snapshot;
 
 static Snapshot g_snap;                 /* guarded by g_lock */
@@ -293,6 +296,72 @@ static void gpu_sample(Snapshot *s)
     s->gpu_load = u.gpu;
 }
 
+/* ------------------------------------------------- Claude Code sessions */
+
+/* claude-state.ps1, run from Claude Code hooks, keeps one file per session
+   ("working" or "idle") and one per running subagent under this folder.
+   Files that stop being updated (crashed or interrupted sessions) expire. */
+static wchar_t g_claude_dir[MAX_PATH];
+
+#define BUSY_EXPIRE_S   (2 * 3600)
+#define IDLE_EXPIRE_S   (24 * 3600)
+
+static ULONGLONG file_age_s(const WIN32_FIND_DATAW *fd)
+{
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    return (ft_to_u64(now) - ft_to_u64(fd->ftLastWriteTime)) / 10000000ULL;
+}
+
+static int file_says_working(const wchar_t *path)
+{
+    char buf[8] = {0};
+    DWORD got = 0;
+    HANDLE f = CreateFileW(path, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    ReadFile(f, buf, 7, &got, NULL);
+    CloseHandle(f);
+    return strncmp(buf, "working", 7) == 0;
+}
+
+static void claude_sample(Snapshot *s)
+{
+    wchar_t pat[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    s->claude_busy = s->claude_idle = s->claude_agents = 0;
+
+    swprintf(pat, MAX_PATH, L"%s\\sessions\\*", g_claude_dir);
+    h = FindFirstFileW(pat, &fd);
+    s->claude_ok = h != INVALID_HANDLE_VALUE;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            swprintf(path, MAX_PATH, L"%s\\sessions\\%s", g_claude_dir, fd.cFileName);
+            if (file_says_working(path)) {
+                if (file_age_s(&fd) < BUSY_EXPIRE_S) s->claude_busy++;
+            } else if (file_age_s(&fd) < IDLE_EXPIRE_S) {
+                s->claude_idle++;
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    swprintf(pat, MAX_PATH, L"%s\\agents\\*", g_claude_dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                file_age_s(&fd) < BUSY_EXPIRE_S)
+                s->claude_agents++;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+}
+
 /* ------------------------------------------------------- sampler thread */
 
 /* WMI calls into the BIOS can take tens of milliseconds, so sampling runs
@@ -320,6 +389,7 @@ static DWORD WINAPI sampler(LPVOID unused)
         s.mem_used_gb = (mem.ullTotalPhys - mem.ullAvailPhys) / (1024.0 * 1024 * 1024);
         if (have_asus) asus_sample(&s);
         if (s.gpu_ok) gpu_sample(&s);
+        claude_sample(&s);
 
         s.cpu_temp = -1;
         for (i = 0; i < s.nsens; i++)
@@ -353,11 +423,13 @@ static COLORREF temp_color(int c)
     return RGB(255, 80, 80);
 }
 
-#define FAN_COLOR RGB(120, 200, 255)
+#define FAN_COLOR    RGB(120, 200, 255)
+#define CLAUDE_COLOR RGB(230, 140, 90)
+#define IDLE_COLOR   RGB(150, 150, 150)
 
 static int line_count(const Snapshot *s)
 {
-    return 2 + (s->gpu_ok ? 1 : 0) + s->nsens;
+    return 2 + (s->gpu_ok ? 1 : 0) + s->nsens + (s->claude_ok ? 2 : 0);
 }
 
 static void draw_row(HDC hdc, int row, const wchar_t *label, const wchar_t *value, COLORREF col)
@@ -409,6 +481,13 @@ static void paint(HWND hwnd)
             swprintf(buf, 64, L"%d rpm", se->value);
             draw_row(hdc, row++, se->label, buf, FAN_COLOR);
         }
+    }
+
+    if (s.claude_ok) {
+        swprintf(buf, 64, L"%d busy / %d idle", s.claude_busy, s.claude_idle);
+        draw_row(hdc, row++, L"Claude", buf, s.claude_busy ? CLAUDE_COLOR : IDLE_COLOR);
+        swprintf(buf, 64, L"%d", s.claude_agents);
+        draw_row(hdc, row++, L"Subagents", buf, s.claude_agents ? CLAUDE_COLOR : IDLE_COLOR);
     }
     EndPaint(hwnd, &ps);
 }
@@ -481,11 +560,7 @@ static void tray_update(int add)
     s = g_snap;
     LeaveCriticalSection(&g_lock);
 
-    /* Icon shows CPU temperature, or CPU load if no temperature sensor. */
-    if (s.cpu_temp >= 0)
-        g_tray_icon = make_number_icon(s.cpu_temp, temp_color(s.cpu_temp));
-    else
-        g_tray_icon = make_number_icon((int)(s.cpu + 0.5), load_color(s.cpu));
+    g_tray_icon = make_number_icon((int)(s.cpu + 0.5), load_color(s.cpu));
 
     nid.cbSize = sizeof nid;
     nid.hWnd = g_hwnd;
@@ -503,6 +578,10 @@ static void tray_update(int add)
     wcscat_s(nid.szTip, 128, line);
     if (s.gpu_ok) {
         swprintf(line, 64, L"\nGPU %u%%  %u°C", s.gpu_load, s.gpu_temp);
+        wcscat_s(nid.szTip, 128, line);
+    }
+    if (s.claude_ok) {
+        swprintf(line, 64, L"\nClaude %d busy, %d agents", s.claude_busy, s.claude_agents);
         wcscat_s(nid.szTip, 128, line);
     }
     for (i = 0; i < s.nsens; i++) {
@@ -609,6 +688,8 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     SetProcessDPIAware();
     InitializeCriticalSection(&g_lock);
+    GetEnvironmentVariableW(L"USERPROFILE", g_claude_dir, MAX_PATH);
+    wcscat_s(g_claude_dir, MAX_PATH, L"\\.claude\\hw-overlay");
     g_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
 
     wc.lpfnWndProc   = wnd_proc;
