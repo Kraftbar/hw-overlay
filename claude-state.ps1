@@ -1,5 +1,6 @@
 # Claude Code hook: records session/subagent state for hw-overlay.
-# Usage (from a hook): pwsh -NoProfile -File claude-state.ps1 <working|idle|end|agent-start|agent-stop|bg-start>
+# Usage (from a hook): pwsh -NoProfile -File claude-state.ps1 <working|idle|needs|end|agent-start|agent-stop|bg-start>
+# "needs" = waiting for the user (permission prompt or question).
 # Hook input JSON arrives on stdin. Never fails the hook.
 #
 # Session file, one line each: state, project folder name, latest prompt.
@@ -24,7 +25,7 @@ try {
     }
 
     switch ($State) {
-        { $_ -in 'working', 'idle' } {
+        { $_ -in 'working', 'idle', 'needs' } {
             $old = @(if (Test-Path $file) { Get-Content $file -Encoding utf8 })
             $folder = if ($in.cwd) { Split-Path $in.cwd -Leaf } elseif ($old.Count -gt 1) { $old[1] } else { '' }
             if ($folder -like 'scratch-*') { $folder = '' }

@@ -29,7 +29,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define WIN_W        360
+#define WIN_W        420
 #define LINE_H       26
 #define PAD          8
 #define MARGIN       10
@@ -64,8 +64,10 @@ typedef struct {
     wchar_t jobs[MAX_JOBS][64];
 } ClaudeSession;
 
-enum { CS_IDLE, CS_BG, CS_BUSY };      /* CS_BG: turn done, background work running */
-static const wchar_t *const CS_NAME[] = { L"idle", L"bg", L"busy" };
+/* CS_BG: turn done, background work running. CS_NEEDS: waiting for the user
+   (permission prompt or question). */
+enum { CS_IDLE, CS_BG, CS_BUSY, CS_NEEDS, CS_COUNT };
+static const wchar_t *const CS_NAME[] = { L"idle", L"bg", L"busy", L"needs you" };
 
 typedef struct {
     double cpu;
@@ -77,7 +79,7 @@ typedef struct {
     int nsens;
     Sensor sens[MAX_SENS];
     int claude_ok;                      /* hook state folder exists */
-    int claude_busy, claude_bg, claude_idle, claude_agents;
+    int claude_needs, claude_busy, claude_bg, claude_idle, claude_agents;
     int nclaude;
     ClaudeSession claude[MAX_CLAUDE];
 } Snapshot;
@@ -378,7 +380,7 @@ static void claude_sample(Snapshot *s)
     HANDLE h;
     int i;
 
-    s->claude_busy = s->claude_bg = s->claude_idle = s->claude_agents = 0;
+    s->claude_needs = s->claude_busy = s->claude_bg = s->claude_idle = s->claude_agents = 0;
     s->nclaude = 0;
 
     swprintf(pat, MAX_PATH, L"%s\\sessions\\*", g_claude_dir);
@@ -386,23 +388,25 @@ static void claude_sample(Snapshot *s)
     s->claude_ok = h != INVALID_HANDLE_VALUE;
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            int busy;
+            int state;
             ClaudeSession *cs;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             swprintf(path, MAX_PATH, L"%s\\sessions\\%s", g_claude_dir, fd.cFileName);
             read_lines(path, lines);
             if (lines[2][0] == L'<') lines[2][0] = 0;      /* system message, not a prompt */
-            busy = wcscmp(lines[0], L"working") == 0;
-            if (busy) {
+            state = wcscmp(lines[0], L"working") == 0 ? CS_BUSY
+                  : wcscmp(lines[0], L"needs") == 0   ? CS_NEEDS : CS_IDLE;
+            if (state != CS_IDLE) {
                 if (file_age_s(&fd) >= BUSY_EXPIRE_S) continue;
-                s->claude_busy++;
+                if (state == CS_NEEDS) s->claude_needs++;
+                else s->claude_busy++;
             } else {
                 if (file_age_s(&fd) >= IDLE_EXPIRE_S) continue;
                 s->claude_idle++;
             }
             if (s->nclaude >= MAX_CLAUDE) continue;
             cs = &s->claude[s->nclaude++];
-            cs->state = busy ? CS_BUSY : CS_IDLE;
+            cs->state = state;
             cs->agents = cs->njobs = 0;
             wcsncpy_s(cs->sid, 40, fd.cFileName, _TRUNCATE);
             if (lines[1][0] && lines[2][0])
@@ -546,10 +550,10 @@ static const char WEB_PAGE[] =
     "?row(esc(s.label),s.value+'\xC2\xB0\x43',temp(s.value)):row(esc(s.label),s.value+' rpm',F);"
     "if(d.claude){const c=d.claude;"
     "const n=(v,w,col)=>`<span style='color:${col}'>${v} ${w}</span>`;"
-    "h+='<div class=h>Claude</div>'+row('Active '+n(c.busy+c.bg,'',c.busy+c.bg?C:I),"
-    "n(c.busy,'busy',C)+' / '+(c.bg?n(c.bg,'bg',Y)+' / ':'')+n(c.idle,'idle',I),I);"
+    "h+='<div class=h>Claude</div>'+row('Active '+n(c.needs+c.busy+c.bg,'',c.needs+c.busy+c.bg?C:I),"
+    "(c.needs?n(c.needs,'needs you',R)+' / ':'')+n(c.busy,'busy',C)+' / '+(c.bg?n(c.bg,'bg',Y)+' / ':'')+n(c.idle,'idle',I),I);"
     "for(const s of c.sessions){if(s.state=='idle')continue;h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
-    "s.state=='busy'?C:s.state=='bg'?Y:I);"
+    "s.state=='needs you'?R:s.state=='busy'?C:s.state=='bg'?Y:I);"
     "for(const j of s.jobs||[])h+=`<div class='r j'><span>\xE2\x80\xA2 ${esc(j)}</span></div>`}"
     "}"
     "m.innerHTML=h;e.textContent=''}catch(x){e.textContent='PC not reachable'}}"
@@ -613,10 +617,10 @@ static void build_json(Buf *b)
         bprintf(b, "\"claude\":null}");
         return;
     }
-    bprintf(b, "\"claude\":{\"busy\":%d,\"bg\":%d,\"idle\":%d,\"background\":%d,\"sessions\":[",
-            s.claude_busy, s.claude_bg, s.claude_idle, s.claude_agents);
+    bprintf(b, "\"claude\":{\"needs\":%d,\"busy\":%d,\"bg\":%d,\"idle\":%d,\"background\":%d,\"sessions\":[",
+            s.claude_needs, s.claude_busy, s.claude_bg, s.claude_idle, s.claude_agents);
     first = 1;
-    for (st = CS_BUSY; st >= CS_IDLE; st--) {
+    for (st = CS_NEEDS; st >= CS_IDLE; st--) {
         for (i = 0; i < s.nclaude; i++) {
             if (s.claude[i].state != st) continue;
             bprintf(b, "%s{\"label\":", first ? "" : ",");
@@ -752,7 +756,9 @@ static COLORREF temp_color(int c)
 #define BG_COLOR     RGB(240, 210, 60)
 #define IDLE_COLOR   RGB(150, 150, 150)
 
-static const COLORREF CS_COLOR[] = { IDLE_COLOR, BG_COLOR, CLAUDE_COLOR };
+#define NEEDS_COLOR  RGB(255, 80, 80)
+
+static const COLORREF CS_COLOR[] = { IDLE_COLOR, BG_COLOR, CLAUDE_COLOR, NEEDS_COLOR };
 
 #define MAX_SESSION_ROWS 14             /* sessions plus their job lines */
 
@@ -842,30 +848,34 @@ static void paint(HWND hwnd)
     }
 
     if (s.claude_ok) {
-        /* "2 busy / 1 bg / 5 idle", each count in its state's colour. */
+        /* "1 needs you / 2 busy / 1 bg / 5 idle", each count in its state's
+           colour; "needs you" and "bg" only when there are any. */
         {
-            wchar_t part[3][24];
-            int count[3], st, x = WIN_W - 10, y = PAD + row * LINE_H;
+            wchar_t part[CS_COUNT][24];
+            int count[CS_COUNT], st, active, last, x = WIN_W - 10, y = PAD + row * LINE_H;
             SIZE sz;
             count[CS_IDLE] = s.claude_idle;
             count[CS_BG] = s.claude_bg;
             count[CS_BUSY] = s.claude_busy;
+            count[CS_NEEDS] = s.claude_needs;
+            last = count[CS_NEEDS] ? CS_NEEDS : CS_BUSY;     /* leftmost part */
             /* "Active N": how many are doing something, N in orange when > 0 */
+            active = s.claude_needs + s.claude_busy + s.claude_bg;
             draw_row(hdc, row++, L"Active", L"", IDLE_COLOR);
             GetTextExtentPoint32W(hdc, L"Active ", 7, &sz);
-            swprintf(part[0], 24, L"%d", s.claude_busy + s.claude_bg);
-            SetTextColor(hdc, s.claude_busy + s.claude_bg ? CLAUDE_COLOR : IDLE_COLOR);
+            swprintf(part[0], 24, L"%d", active);
+            SetTextColor(hdc, active ? CLAUDE_COLOR : IDLE_COLOR);
             SetTextAlign(hdc, TA_LEFT);
             TextOutW(hdc, 10 + sz.cx, y, part[0], (int)wcslen(part[0]));
             SetTextAlign(hdc, TA_RIGHT);
-            for (st = CS_IDLE; st <= CS_BUSY; st++) {      /* drawn right to left */
+            for (st = CS_IDLE; st <= last; st++) {         /* drawn right to left */
                 if (st == CS_BG && !count[CS_BG]) continue;
                 swprintf(part[st], 24, L"%d %s", count[st], CS_NAME[st]);
                 SetTextColor(hdc, CS_COLOR[st]);
                 TextOutW(hdc, x, y, part[st], (int)wcslen(part[st]));
                 GetTextExtentPoint32W(hdc, part[st], (int)wcslen(part[st]), &sz);
                 x -= sz.cx;
-                if (st != CS_BUSY) {
+                if (st != last) {
                     SetTextColor(hdc, IDLE_COLOR);
                     TextOutW(hdc, x, y, L" / ", 3);
                     GetTextExtentPoint32W(hdc, L" / ", 3, &sz);
@@ -879,7 +889,7 @@ static void paint(HWND hwnd)
         {
             int st, j, shown = 0;
             wchar_t label[140];
-            for (st = CS_BUSY; st > CS_IDLE; st--) {
+            for (st = CS_NEEDS; st > CS_IDLE; st--) {
                 for (i = 0; i < s.nclaude && shown < MAX_SESSION_ROWS; i++) {
                     const ClaudeSession *cs = &s.claude[i];
                     if (cs->state != st) continue;
@@ -1045,7 +1055,7 @@ static void add_claude_items(HMENU m)
     if (!s.claude_ok) return;
 
     AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"Claude sessions");
-    for (st = CS_BUSY; st >= CS_IDLE; st--) {
+    for (st = CS_NEEDS; st >= CS_IDLE; st--) {
         for (i = 0; i < s.nclaude; i++) {
             const ClaudeSession *cs = &s.claude[i];
             if (cs->state != st) continue;
@@ -1054,7 +1064,7 @@ static void add_claude_items(HMENU m)
                 swprintf(item, 320, L"%s\t%s  +%d in background", esc, CS_NAME[st], cs->agents);
             else
                 swprintf(item, 320, L"%s\t%s", esc, CS_NAME[st]);
-            AppendMenuW(m, MF_STRING | (st == CS_BUSY ? MF_CHECKED : 0), IDM_SESSION, item);
+            AppendMenuW(m, MF_STRING | (st >= CS_BUSY ? MF_CHECKED : 0), IDM_SESSION, item);
             for (j = 0; j < cs->njobs; j++) {
                 menu_escape(esc, 256, cs->jobs[j]);
                 swprintf(item, 320, L"      • %s", esc);
