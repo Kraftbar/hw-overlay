@@ -496,15 +496,16 @@ static const char WEB_PAGE[] =
     ".r{display:flex;justify-content:space-between;padding:6px 4px;border-bottom:1px solid #222}"
     ".r span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px}"
     ".v{font-weight:bold;white-space:nowrap}.h{color:#888;font-size:13px;margin:16px 4px 2px}#e{color:#f55;padding:8px 4px}"
-    "#k{width:100%;margin:0 0 8px;padding:10px;background:#222;color:#ddd;border:1px solid #333;border-radius:6px;font:inherit}"
-    "#k.on{color:#50e678}"
-    "</style></head><body><button id=k hidden>Keep screen on</button><div id=m></div><div id=e></div><script>"
+    "#k,#s{width:100%;margin:0 0 8px;padding:10px;background:#222;color:#ddd;border:1px solid #333;border-radius:6px;font:inherit}"
+    "#k.on{color:#50e678}#s{margin-top:16px;color:#888}"
+    "</style></head><body><button id=k hidden>Keep screen on</button><div id=m></div><div id=e></div><button id=s hidden>Change PC address</button><script>"
     /* Keep the phone awake with the Wake Lock API. Chrome only offers it on
        secure origins, so the button only shows where it can work: over HTTPS,
        on localhost, or with this address allowed in chrome://flags. The choice
        is remembered on the phone, and the lock is taken again whenever Chrome
        drops it (tab hidden, page reloaded) while the page is visible.
-       Turning it on also goes full screen (that part needs the tap itself). */
+       Turning it on also goes full screen (that part needs the tap itself).
+       Inside the Android app (window.HwApp) the app does both instead. */
     "let lock=null,want=false;try{want=localStorage.getItem('awake')=='1'}catch(x){}"
     "function label(){k.textContent=want?(lock?'Screen stays on':'Keep screen on (waiting)'):'Keep screen on';"
     "k.classList.toggle('on',want&&!!lock)}"
@@ -514,7 +515,10 @@ static const char WEB_PAGE[] =
     "k.onclick=()=>{want=!want;try{localStorage.setItem('awake',want?'1':'0')}catch(x){}"
     "if(want){awake();document.documentElement.requestFullscreen&&document.documentElement.requestFullscreen().catch(()=>{})}"
     "else{if(lock){const l=lock;lock=null;l.release()}document.fullscreenElement&&document.exitFullscreen()}label()};"
-    "if(navigator.wakeLock){k.hidden=false;label();awake();"
+    "if(window.HwApp){const a=window.HwApp;want=a.isAwake();k.hidden=s.hidden=false;"
+    "const lb=()=>{k.textContent=want?'Screen stays on':'Keep screen on';k.classList.toggle('on',want)};lb();"
+    "k.onclick=()=>{want=!want;a.setAwake(want);lb()};s.onclick=()=>a.changeAddress()}"
+    "else if(navigator.wakeLock){k.hidden=false;label();awake();"
     "document.addEventListener('visibilitychange',awake);setInterval(awake,5000)}"
     "const G='#50e678',Y='#f0d23c',R='#ff5050',F='#78c8ff',C='#e68c5a',I='#969696';"
     "const load=p=>p<60?G:p<85?Y:R,temp=c=>c<60?G:c<80?Y:R;"
