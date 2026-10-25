@@ -503,7 +503,8 @@ static const char WEB_PAGE[] =
        secure origins, so the button only shows where it can work: over HTTPS,
        on localhost, or with this address allowed in chrome://flags. The choice
        is remembered on the phone, and the lock is taken again whenever Chrome
-       drops it (tab hidden, page reloaded) while the page is visible. */
+       drops it (tab hidden, page reloaded) while the page is visible.
+       Turning it on also goes full screen (that part needs the tap itself). */
     "let lock=null,want=false;try{want=localStorage.getItem('awake')=='1'}catch(x){}"
     "function label(){k.textContent=want?(lock?'Screen stays on':'Keep screen on (waiting)'):'Keep screen on';"
     "k.classList.toggle('on',want&&!!lock)}"
@@ -511,7 +512,8 @@ static const char WEB_PAGE[] =
     "try{lock=await navigator.wakeLock.request('screen');"
     "lock.onrelease=()=>{lock=null;label();setTimeout(awake,500)}}catch(x){}label()}"
     "k.onclick=()=>{want=!want;try{localStorage.setItem('awake',want?'1':'0')}catch(x){}"
-    "if(want)awake();else if(lock){const l=lock;lock=null;l.release()}label()};"
+    "if(want){awake();document.documentElement.requestFullscreen&&document.documentElement.requestFullscreen().catch(()=>{})}"
+    "else{if(lock){const l=lock;lock=null;l.release()}document.fullscreenElement&&document.exitFullscreen()}label()};"
     "if(navigator.wakeLock){k.hidden=false;label();awake();"
     "document.addEventListener('visibilitychange',awake);setInterval(awake,5000)}"
     "const G='#50e678',Y='#f0d23c',R='#ff5050',F='#78c8ff',C='#e68c5a',I='#969696';"
