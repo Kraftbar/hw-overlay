@@ -60,8 +60,9 @@ typedef struct {
     wchar_t label[128];                 /* "folder: latest prompt" */
     int state;                          /* CS_IDLE, CS_BG or CS_BUSY */
     int agents;                         /* subagents + background tasks */
-    int njobs;                          /* names of the first MAX_JOBS of them */
+    int njobs;                          /* distinct names, e.g. "Explore agent ×3" */
     wchar_t jobs[MAX_JOBS][64];
+    int jobn[MAX_JOBS];                 /* how many share each name */
 } ClaudeSession;
 
 /* CS_BG: turn done, background work running. CS_NEEDS: waiting for the user
@@ -376,6 +377,8 @@ static int read_lines(const wchar_t *path, wchar_t lines[4][128])
 static void claude_sample(Snapshot *s)
 {
     wchar_t pat[MAX_PATH], path[MAX_PATH], lines[4][128];
+    const wchar_t *name;
+    int k;
     WIN32_FIND_DATAW fd;
     HANDLE h;
     int i;
@@ -437,15 +440,30 @@ static void claude_sample(Snapshot *s)
                 if (wcsncmp(fd.cFileName, cs->sid, n) != 0 || fd.cFileName[n] != L'.')
                     continue;
                 cs->agents++;
-                if (cs->njobs < MAX_JOBS) {
-                    swprintf(path, MAX_PATH, L"%s\\agents\\%s", g_claude_dir, fd.cFileName);
-                    read_lines(path, lines);
-                    wcsncpy_s(cs->jobs[cs->njobs++], 64,
-                              lines[0][0] ? lines[0] : L"background job", _TRUNCATE);
+                swprintf(path, MAX_PATH, L"%s\\agents\\%s", g_claude_dir, fd.cFileName);
+                read_lines(path, lines);
+                name = lines[0][0] ? lines[0] : L"background job";
+                for (k = 0; k < cs->njobs && wcsncmp(cs->jobs[k], name, 50) != 0; k++)
+                    ;
+                if (k < cs->njobs) {
+                    cs->jobn[k]++;
+                } else if (cs->njobs < MAX_JOBS) {
+                    wcsncpy_s(cs->jobs[cs->njobs], 64, name, 50);
+                    cs->jobn[cs->njobs++] = 1;
                 }
             }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
+    }
+
+    /* "general-purpose agent ×15" instead of fifteen identical lines. */
+    for (i = 0; i < s->nclaude; i++) {
+        for (k = 0; k < s->claude[i].njobs; k++) {
+            wchar_t times[16];
+            if (s->claude[i].jobn[k] < 2) continue;
+            swprintf(times, 16, L" ×%d", s->claude[i].jobn[k]);
+            wcsncat_s(s->claude[i].jobs[k], 64, times, _TRUNCATE);
+        }
     }
 
     /* An idle session with work still running in the background isn't idle. */
