@@ -41,11 +41,16 @@ try {
         }
         'agent-start' {
             $aid = ($in.agent_id -replace '[^\w-]', '')
-            if ($aid) { Set-Content -NoNewline -Path (Join-Path $agents "$sid.$aid") -Value $in.agent_type }
+            $name = if ($in.agent_type) { "$($in.agent_type) agent" } else { 'agent' }
+            if ($aid) { Set-Content -NoNewline -Encoding utf8NoBOM -Path (Join-Path $agents "$sid.$aid") -Value $name }
         }
         'bg-start' {
+            # Named after the tool call's description, or its command.
             $tid = ($in.tool_use_id -replace '[^\w-]', '')
-            if ($tid) { Set-Content -NoNewline -Path (Join-Path $agents "$sid.bg-$tid") -Value $in.tool_name }
+            $what = if ($in.tool_input.description) { $in.tool_input.description } else { "$($in.tool_input.command)" }
+            $what = ($what -replace '\s+', ' ').Trim()
+            if ($what.Length -gt 50) { $what = $what.Substring(0, 50) + '...' }
+            if ($tid) { Set-Content -NoNewline -Encoding utf8NoBOM -Path (Join-Path $agents "$sid.bg-$tid") -Value "$($in.tool_name): $what" }
         }
         'agent-stop' {
             $aid = ($in.agent_id -replace '[^\w-]', '')

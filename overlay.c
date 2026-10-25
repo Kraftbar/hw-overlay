@@ -53,12 +53,15 @@ typedef struct {
 } Sensor;
 
 #define MAX_CLAUDE   16
+#define MAX_JOBS     4
 
 typedef struct {
     wchar_t sid[40];
     wchar_t label[128];                 /* "folder: latest prompt" */
     int state;                          /* CS_IDLE, CS_BG or CS_BUSY */
     int agents;                         /* subagents + background tasks */
+    int njobs;                          /* names of the first MAX_JOBS of them */
+    wchar_t jobs[MAX_JOBS][64];
 } ClaudeSession;
 
 enum { CS_IDLE, CS_BG, CS_BUSY };      /* CS_BG: turn done, background work running */
@@ -400,7 +403,7 @@ static void claude_sample(Snapshot *s)
             if (s->nclaude >= MAX_CLAUDE) continue;
             cs = &s->claude[s->nclaude++];
             cs->state = busy ? CS_BUSY : CS_IDLE;
-            cs->agents = 0;
+            cs->agents = cs->njobs = 0;
             wcsncpy_s(cs->sid, 40, fd.cFileName, _TRUNCATE);
             if (lines[1][0] && lines[2][0])
                 swprintf(cs->label, 128, L"%s: %s", lines[1], lines[2]);
@@ -412,7 +415,8 @@ static void claude_sample(Snapshot *s)
         FindClose(h);
     }
 
-    /* Agent files are named "<session id>.<agent id>" or "<session id>.bg-<tool call id>". */
+    /* Agent files are named "<session id>.<agent id>" or "<session id>.bg-<tool call id>"
+       and hold what is running, e.g. "Explore agent" or "Bash: Run tests". */
     swprintf(pat, MAX_PATH, L"%s\\agents\\*", g_claude_dir);
     h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -423,8 +427,16 @@ static void claude_sample(Snapshot *s)
             s->claude_agents++;
             for (i = 0; i < s->nclaude; i++) {
                 size_t n = wcslen(s->claude[i].sid);
-                if (wcsncmp(fd.cFileName, s->claude[i].sid, n) == 0 && fd.cFileName[n] == L'.')
-                    s->claude[i].agents++;
+                ClaudeSession *cs = &s->claude[i];
+                if (wcsncmp(fd.cFileName, cs->sid, n) != 0 || fd.cFileName[n] != L'.')
+                    continue;
+                cs->agents++;
+                if (cs->njobs < MAX_JOBS) {
+                    swprintf(path, MAX_PATH, L"%s\\agents\\%s", g_claude_dir, fd.cFileName);
+                    read_lines(path, lines);
+                    wcsncpy_s(cs->jobs[cs->njobs++], 64,
+                              lines[0][0] ? lines[0] : L"background job", _TRUNCATE);
+                }
             }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
@@ -497,6 +509,7 @@ static const char WEB_PAGE[] =
     ".r span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px}"
     ".v{font-weight:bold;white-space:nowrap}.h{color:#888;font-size:13px;margin:16px 4px 2px}#e{color:#f55;padding:8px 4px}"
     "#k,#s{width:100%;margin:0 0 8px;padding:10px;background:#222;color:#ddd;border:1px solid #333;border-radius:6px;font:inherit}"
+    ".j{color:#999;font-size:14px;padding-left:20px}"
     "#k.on{color:#50e678}#s{margin-top:16px;color:#888}"
     "</style></head><body><button id=k hidden>Keep screen on</button><div id=m></div><div id=e></div><button id=s hidden>Change PC address</button><script>"
     /* Keep the phone awake with the Wake Lock API. Chrome only offers it on
@@ -533,8 +546,9 @@ static const char WEB_PAGE[] =
     "?row(esc(s.label),s.value+'\xC2\xB0\x43',temp(s.value)):row(esc(s.label),s.value+' rpm',F);"
     "if(d.claude){const c=d.claude;"
     "h+='<div class=h>Claude</div>'+row('Sessions',c.busy+' busy / '+c.bg+' bg / '+c.idle+' idle',c.busy?C:I);"
-    "for(const s of c.sessions)h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
+    "for(const s of c.sessions){h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
     "s.state=='busy'?C:s.state=='bg'?Y:I);"
+    "for(const j of s.jobs||[])h+=`<div class='r j'><span>\xE2\x80\xA2 ${esc(j)}</span></div>`}"
     "h+=row('Background',c.background,c.background?C:I);}"
     "m.innerHTML=h;e.textContent=''}catch(x){e.textContent='PC not reachable'}}"
     "tick();setInterval(tick,1000)"
@@ -570,7 +584,7 @@ static void bjson_str(Buf *b, const wchar_t *w)
 static void build_json(Buf *b)
 {
     Snapshot s;
-    int i, st, first;
+    int i, j, st, first;
 
     EnterCriticalSection(&g_lock);
     s = g_snap;
@@ -605,7 +619,12 @@ static void build_json(Buf *b)
             if (s.claude[i].state != st) continue;
             bprintf(b, "%s{\"label\":", first ? "" : ",");
             bjson_str(b, s.claude[i].label);
-            bprintf(b, ",\"state\":\"%ls\",\"agents\":%d}", CS_NAME[st], s.claude[i].agents);
+            bprintf(b, ",\"state\":\"%ls\",\"agents\":%d,\"jobs\":[", CS_NAME[st], s.claude[i].agents);
+            for (j = 0; j < s.claude[i].njobs; j++) {
+                if (j) bprintf(b, ",");
+                bjson_str(b, s.claude[i].jobs[j]);
+            }
+            bprintf(b, "]}");
             first = 0;
         }
     }
@@ -733,11 +752,14 @@ static COLORREF temp_color(int c)
 
 static const COLORREF CS_COLOR[] = { IDLE_COLOR, BG_COLOR, CLAUDE_COLOR };
 
-#define MAX_SESSION_ROWS 8
+#define MAX_SESSION_ROWS 14             /* sessions plus their job lines */
 
 static int session_rows(const Snapshot *s)
 {
-    return s->nclaude < MAX_SESSION_ROWS ? s->nclaude : MAX_SESSION_ROWS;
+    int i, n = 0;
+    for (i = 0; i < s->nclaude; i++)
+        n += 1 + s->claude[i].njobs;
+    return n < MAX_SESSION_ROWS ? n : MAX_SESSION_ROWS;
 }
 
 static int line_count(const Snapshot *s)
@@ -823,9 +845,10 @@ static void paint(HWND hwnd)
             swprintf(buf, 64, L"%d busy / %d idle", s.claude_busy, s.claude_idle);
         draw_row(hdc, row++, L"Claude", buf, s.claude_busy ? CLAUDE_COLOR : IDLE_COLOR);
 
-        /* One row per session: busy, then bg, then idle. */
+        /* One row per session (busy, then bg, then idle), each followed by
+           what it is running. */
         {
-            int st, shown = 0;
+            int st, j, shown = 0;
             wchar_t label[140];
             for (st = CS_BUSY; st >= CS_IDLE; st--) {
                 for (i = 0; i < s.nclaude && shown < MAX_SESSION_ROWS; i++) {
@@ -838,6 +861,10 @@ static void paint(HWND hwnd)
                         wcscpy_s(buf, 64, CS_NAME[st]);
                     draw_row_fit(hdc, row++, label, buf, CS_COLOR[st]);
                     shown++;
+                    for (j = 0; j < cs->njobs && shown < MAX_SESSION_ROWS; j++, shown++) {
+                        swprintf(label, 140, L"    • %s", cs->jobs[j]);
+                        draw_row_fit(hdc, row++, label, L"", IDLE_COLOR);
+                    }
                 }
             }
         }
@@ -984,7 +1011,7 @@ static void add_claude_items(HMENU m)
 {
     Snapshot s;
     wchar_t esc[256], item[320];
-    int st, i, any = 0;
+    int st, i, j, any = 0;
 
     EnterCriticalSection(&g_lock);
     s = g_snap;
@@ -1002,6 +1029,11 @@ static void add_claude_items(HMENU m)
             else
                 swprintf(item, 320, L"%s\t%s", esc, CS_NAME[st]);
             AppendMenuW(m, MF_STRING | (st == CS_BUSY ? MF_CHECKED : 0), IDM_SESSION, item);
+            for (j = 0; j < cs->njobs; j++) {
+                menu_escape(esc, 256, cs->jobs[j]);
+                swprintf(item, 320, L"      • %s", esc);
+                AppendMenuW(m, MF_STRING, IDM_SESSION, item);
+            }
             any = 1;
         }
     }
