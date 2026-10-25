@@ -570,8 +570,8 @@ static const char WEB_PAGE[] =
     "?row(esc(s.label),s.value+'\xC2\xB0\x43',temp(s.value)):row(esc(s.label),s.value+' rpm',F);"
     "if(d.claude){const c=d.claude;"
     "const n=(v,w,col)=>`<span style='color:${col}'>${v} ${w}</span>`;"
-    "h+='<div class=h>Claude</div>'+row('Active '+n(c.needs+c.busy+c.bg,'',c.needs+c.busy+c.bg?C:I),"
-    "c.needs?n(c.needs,'needs you',R):'',I);"
+    "h+='<div class=h></div>'+row('Claude',(c.needs?n(c.needs,'needs you',R)+' / ':'')+n(c.needs+c.busy+c.bg,'active',c.needs+c.busy+c.bg?C:I),"
+    "I);"
     "for(const s of c.sessions){if(s.state=='idle')continue;h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
     "s.state=='needs you'?R:s.state=='busy'?C:s.state=='bg'?Y:I);"
     "for(const j of s.jobs||[])h+=`<div class='r j'><span>\xE2\x80\xA2 ${esc(j)}</span></div>`}"
@@ -868,20 +868,20 @@ static void paint(HWND hwnd)
     }
 
     if (s.claude_ok) {
-        /* "Active N" (how many are doing something, N in orange when > 0) and,
-        on the right, "N needs you" in red when any are waiting on the user. */
+        /* "Claude ... 1 needs you / 5 active": how many are doing something,
+           and in red how many of them are waiting on the user. */
         {
-            wchar_t num[24];
+            wchar_t act[24], needs[24];
             int active = s.claude_needs + s.claude_busy + s.claude_bg, y = PAD + row * LINE_H;
             SIZE sz;
-            if (s.claude_needs)
-                swprintf(num, 24, L"%d needs you", s.claude_needs);
-            draw_row(hdc, row++, L"Active", s.claude_needs ? num : L"", NEEDS_COLOR);
-            GetTextExtentPoint32W(hdc, L"Active ", 7, &sz);
-            swprintf(num, 24, L"%d", active);
-            SetTextColor(hdc, active ? CLAUDE_COLOR : IDLE_COLOR);
-            SetTextAlign(hdc, TA_LEFT);
-            TextOutW(hdc, 10 + sz.cx, y, num, (int)wcslen(num));
+            swprintf(act, 24, L"%d active", active);
+            draw_row(hdc, row++, L"Claude", act, active ? CLAUDE_COLOR : IDLE_COLOR);
+            if (s.claude_needs) {
+                GetTextExtentPoint32W(hdc, act, (int)wcslen(act), &sz);
+                swprintf(needs, 24, L"%d needs you / ", s.claude_needs);
+                SetTextColor(hdc, NEEDS_COLOR);
+                TextOutW(hdc, WIN_W - 10 - sz.cx, y, needs, (int)wcslen(needs));
+            }
         }
 
         /* One row per active session (busy, then bg), each followed by
