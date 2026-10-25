@@ -29,7 +29,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define WIN_W        420
+#define WIN_W        460
 #define LINE_H       26
 #define PAD          8
 #define MARGIN       10
@@ -890,7 +890,7 @@ static void paint(HWND hwnd)
             SetTextAlign(hdc, TA_RIGHT);
             for (st = CS_IDLE; st <= last; st++) {         /* drawn right to left */
                 if (st == CS_BG && !count[CS_BG]) continue;
-                swprintf(part[st], 24, L"%d %s", count[st], CS_NAME[st]);
+                swprintf(part[st], 24, L"%d %s", count[st], st == CS_NEEDS ? L"needs" : CS_NAME[st]);
                 SetTextColor(hdc, CS_COLOR[st]);
                 TextOutW(hdc, x, y, part[st], (int)wcslen(part[st]));
                 GetTextExtentPoint32W(hdc, part[st], (int)wcslen(part[st]), &sz);
