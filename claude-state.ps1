@@ -1,8 +1,10 @@
 # Claude Code hook: records session/subagent state for hw-overlay.
-# Usage (from a hook): pwsh -NoProfile -File claude-state.ps1 <working|idle|end|agent-start|agent-stop>
+# Usage (from a hook): pwsh -NoProfile -File claude-state.ps1 <working|idle|end|agent-start|agent-stop|bg-start>
 # Hook input JSON arrives on stdin. Never fails the hook.
 #
-# Session file, one line each: state, project folder name, first prompt.
+# Session file, one line each: state, project folder name, latest prompt.
+# System messages (task notifications etc. start with "<") are not prompts,
+# and the desktop app's throwaway "scratch-..." folders are left out.
 param([string]$State)
 try {
     $in = [Console]::In.ReadToEnd() | ConvertFrom-Json
@@ -15,14 +17,21 @@ try {
     if (-not $sid) { exit 0 }
     $file = Join-Path $sessions $sid
 
+    # A finished background task comes back as a <task-notification> prompt
+    # naming the tool call that started it.
+    if ($in.prompt -match '<tool-use-id>([\w-]+)</tool-use-id>') {
+        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $agents "$sid.bg-$($Matches[1])")
+    }
+
     switch ($State) {
         { $_ -in 'working', 'idle' } {
             $old = @(if (Test-Path $file) { Get-Content $file -Encoding utf8 })
             $folder = if ($in.cwd) { Split-Path $in.cwd -Leaf } elseif ($old.Count -gt 1) { $old[1] } else { '' }
-            $prompt = if ($old.Count -gt 2 -and $old[2]) { $old[2] } else { '' }
-            if (-not $prompt -and $in.prompt) {
-                $prompt = ($in.prompt -replace '\s+', ' ').Trim()
-                if ($prompt.Length -gt 60) { $prompt = $prompt.Substring(0, 60) + '...' }
+            if ($folder -like 'scratch-*') { $folder = '' }
+            $prompt = if ($old.Count -gt 2 -and -not $old[2].StartsWith('<')) { $old[2] } else { '' }
+            $new = if ($in.prompt) { ($in.prompt -replace '\s+', ' ').Trim() } else { '' }
+            if ($new -and -not $new.StartsWith('<')) {
+                $prompt = if ($new.Length -gt 60) { $new.Substring(0, 60) + '...' } else { $new }
             }
             Set-Content -Path $file -Encoding utf8NoBOM -Value @($State, $folder, $prompt)
         }
@@ -33,6 +42,10 @@ try {
         'agent-start' {
             $aid = ($in.agent_id -replace '[^\w-]', '')
             if ($aid) { Set-Content -NoNewline -Path (Join-Path $agents "$sid.$aid") -Value $in.agent_type }
+        }
+        'bg-start' {
+            $tid = ($in.tool_use_id -replace '[^\w-]', '')
+            if ($tid) { Set-Content -NoNewline -Path (Join-Path $agents "$sid.bg-$tid") -Value $in.tool_name }
         }
         'agent-stop' {
             $aid = ($in.agent_id -replace '[^\w-]', '')

@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <wchar.h>
 
-#define WIN_W        300
+#define WIN_W        360
 #define LINE_H       26
 #define PAD          8
 #define MARGIN       10
@@ -49,10 +49,13 @@ typedef struct {
 
 typedef struct {
     wchar_t sid[40];
-    wchar_t label[128];                 /* "folder: first prompt" */
-    int busy;
-    int agents;
+    wchar_t label[128];                 /* "folder: latest prompt" */
+    int state;                          /* CS_IDLE, CS_BG or CS_BUSY */
+    int agents;                         /* subagents + background tasks */
 } ClaudeSession;
+
+enum { CS_IDLE, CS_BG, CS_BUSY };      /* CS_BG: turn done, background work running */
+static const wchar_t *const CS_NAME[] = { L"idle", L"bg", L"busy" };
 
 typedef struct {
     double cpu;
@@ -64,7 +67,7 @@ typedef struct {
     int nsens;
     Sensor sens[MAX_SENS];
     int claude_ok;                      /* hook state folder exists */
-    int claude_busy, claude_idle, claude_agents;
+    int claude_busy, claude_bg, claude_idle, claude_agents;
     int nclaude;
     ClaudeSession claude[MAX_CLAUDE];
 } Snapshot;
@@ -313,9 +316,8 @@ static void gpu_sample(Snapshot *s)
 
 /* claude-state.ps1, run from Claude Code hooks, keeps one file per session
    (lines: "working"/"idle", project folder, first prompt) and one per running
-   subagent under this folder. Files that stop being updated (crashed or
-   interrupted sessions) expire. Idle sessions that never got a prompt are
-   background helpers and are not counted. */
+   subagent or background task under this folder. Files that stop being
+   updated (crashed or interrupted sessions) expire. */
 static wchar_t g_claude_dir[MAX_PATH];
 
 #define BUSY_EXPIRE_S   (2 * 3600)
@@ -366,7 +368,7 @@ static void claude_sample(Snapshot *s)
     HANDLE h;
     int i;
 
-    s->claude_busy = s->claude_idle = s->claude_agents = 0;
+    s->claude_busy = s->claude_bg = s->claude_idle = s->claude_agents = 0;
     s->nclaude = 0;
 
     swprintf(pat, MAX_PATH, L"%s\\sessions\\*", g_claude_dir);
@@ -379,17 +381,18 @@ static void claude_sample(Snapshot *s)
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
             swprintf(path, MAX_PATH, L"%s\\sessions\\%s", g_claude_dir, fd.cFileName);
             read_lines(path, lines);
+            if (lines[2][0] == L'<') lines[2][0] = 0;      /* system message, not a prompt */
             busy = wcscmp(lines[0], L"working") == 0;
             if (busy) {
                 if (file_age_s(&fd) >= BUSY_EXPIRE_S) continue;
                 s->claude_busy++;
             } else {
-                if (file_age_s(&fd) >= IDLE_EXPIRE_S || !lines[2][0]) continue;
+                if (file_age_s(&fd) >= IDLE_EXPIRE_S) continue;
                 s->claude_idle++;
             }
             if (s->nclaude >= MAX_CLAUDE) continue;
             cs = &s->claude[s->nclaude++];
-            cs->busy = busy;
+            cs->state = busy ? CS_BUSY : CS_IDLE;
             cs->agents = 0;
             wcsncpy_s(cs->sid, 40, fd.cFileName, _TRUNCATE);
             if (lines[1][0] && lines[2][0])
@@ -397,12 +400,12 @@ static void claude_sample(Snapshot *s)
             else if (lines[1][0] || lines[2][0])
                 wcsncpy_s(cs->label, 128, lines[1][0] ? lines[1] : lines[2], _TRUNCATE);
             else
-                wcscpy_s(cs->label, 128, L"(no prompt yet)");
+                swprintf(cs->label, 128, L"session %.8s", fd.cFileName);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
 
-    /* Agent files are named "<session id>.<agent id>". */
+    /* Agent files are named "<session id>.<agent id>" or "<session id>.bg-<tool call id>". */
     swprintf(pat, MAX_PATH, L"%s\\agents\\*", g_claude_dir);
     h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
@@ -418,6 +421,15 @@ static void claude_sample(Snapshot *s)
             }
         } while (FindNextFileW(h, &fd));
         FindClose(h);
+    }
+
+    /* An idle session with work still running in the background isn't idle. */
+    for (i = 0; i < s->nclaude; i++) {
+        if (s->claude[i].state == CS_IDLE && s->claude[i].agents) {
+            s->claude[i].state = CS_BG;
+            s->claude_idle--;
+            s->claude_bg++;
+        }
     }
 }
 
@@ -484,11 +496,22 @@ static COLORREF temp_color(int c)
 
 #define FAN_COLOR    RGB(120, 200, 255)
 #define CLAUDE_COLOR RGB(230, 140, 90)
+#define BG_COLOR     RGB(240, 210, 60)
 #define IDLE_COLOR   RGB(150, 150, 150)
+
+static const COLORREF CS_COLOR[] = { IDLE_COLOR, BG_COLOR, CLAUDE_COLOR };
+
+#define MAX_SESSION_ROWS 8
+
+static int session_rows(const Snapshot *s)
+{
+    return s->nclaude < MAX_SESSION_ROWS ? s->nclaude : MAX_SESSION_ROWS;
+}
 
 static int line_count(const Snapshot *s)
 {
-    return 2 + (s->gpu_ok ? 1 : 0) + s->nsens + (s->claude_ok ? 2 : 0);
+    return 2 + (s->gpu_ok ? 1 : 0) + s->nsens +
+           (s->claude_ok ? 2 + session_rows(s) : 0);
 }
 
 static void draw_row(HDC hdc, int row, const wchar_t *label, const wchar_t *value, COLORREF col)
@@ -500,6 +523,25 @@ static void draw_row(HDC hdc, int row, const wchar_t *label, const wchar_t *valu
     SetTextColor(hdc, col);
     SetTextAlign(hdc, TA_RIGHT);
     TextOutW(hdc, WIN_W - 10, y, value, (int)wcslen(value));
+}
+
+/* Like draw_row, but shortens the label with "…" so it never runs into the value. */
+static void draw_row_fit(HDC hdc, int row, const wchar_t *label, const wchar_t *value, COLORREF col)
+{
+    SIZE ch, vs;
+    wchar_t buf[160];
+    int max;
+
+    GetTextExtentPoint32W(hdc, L"M", 1, &ch);       /* monospace font */
+    GetTextExtentPoint32W(hdc, value, (int)wcslen(value), &vs);
+    max = (WIN_W - 20 - vs.cx - ch.cx) / ch.cx;
+    if ((int)wcslen(label) > max && max > 1) {
+        wcsncpy_s(buf, 160, label, max - 1);
+        wcscat_s(buf, 160, L"…");
+    } else {
+        wcsncpy_s(buf, 160, label, _TRUNCATE);
+    }
+    draw_row(hdc, row, buf, value, col);
 }
 
 static void paint(HWND hwnd)
@@ -543,10 +585,33 @@ static void paint(HWND hwnd)
     }
 
     if (s.claude_ok) {
-        swprintf(buf, 64, L"%d busy / %d idle", s.claude_busy, s.claude_idle);
+        if (s.claude_bg)
+            swprintf(buf, 64, L"%d busy / %d bg / %d idle", s.claude_busy, s.claude_bg, s.claude_idle);
+        else
+            swprintf(buf, 64, L"%d busy / %d idle", s.claude_busy, s.claude_idle);
         draw_row(hdc, row++, L"Claude", buf, s.claude_busy ? CLAUDE_COLOR : IDLE_COLOR);
+
+        /* One row per session: busy, then bg, then idle. */
+        {
+            int st, shown = 0;
+            wchar_t label[140];
+            for (st = CS_BUSY; st >= CS_IDLE; st--) {
+                for (i = 0; i < s.nclaude && shown < MAX_SESSION_ROWS; i++) {
+                    const ClaudeSession *cs = &s.claude[i];
+                    if (cs->state != st) continue;
+                    swprintf(label, 140, L"  %s", cs->label);
+                    if (cs->agents)
+                        swprintf(buf, 64, L"%s +%d", CS_NAME[st], cs->agents);
+                    else
+                        wcscpy_s(buf, 64, CS_NAME[st]);
+                    draw_row_fit(hdc, row++, label, buf, CS_COLOR[st]);
+                    shown++;
+                }
+            }
+        }
+
         swprintf(buf, 64, L"%d", s.claude_agents);
-        draw_row(hdc, row++, L"Subagents", buf, s.claude_agents ? CLAUDE_COLOR : IDLE_COLOR);
+        draw_row(hdc, row++, L"Background", buf, s.claude_agents ? CLAUDE_COLOR : IDLE_COLOR);
     }
     EndPaint(hwnd, &ps);
 }
@@ -687,7 +752,7 @@ static void add_claude_items(HMENU m)
 {
     Snapshot s;
     wchar_t esc[256], item[320];
-    int pass, i, any = 0;
+    int st, i, any = 0;
 
     EnterCriticalSection(&g_lock);
     s = g_snap;
@@ -695,17 +760,16 @@ static void add_claude_items(HMENU m)
     if (!s.claude_ok) return;
 
     AppendMenuW(m, MF_STRING | MF_DISABLED, 0, L"Claude sessions");
-    for (pass = 1; pass >= 0; pass--) {
+    for (st = CS_BUSY; st >= CS_IDLE; st--) {
         for (i = 0; i < s.nclaude; i++) {
             const ClaudeSession *cs = &s.claude[i];
-            if (cs->busy != pass) continue;
+            if (cs->state != st) continue;
             menu_escape(esc, 256, cs->label);
             if (cs->agents)
-                swprintf(item, 320, L"%s\t%s  +%d subagent%s", esc,
-                         cs->busy ? L"busy" : L"idle", cs->agents, cs->agents > 1 ? L"s" : L"");
+                swprintf(item, 320, L"%s\t%s  +%d in background", esc, CS_NAME[st], cs->agents);
             else
-                swprintf(item, 320, L"%s\t%s", esc, cs->busy ? L"busy" : L"idle");
-            AppendMenuW(m, MF_STRING | (cs->busy ? MF_CHECKED : 0), IDM_SESSION, item);
+                swprintf(item, 320, L"%s\t%s", esc, CS_NAME[st]);
+            AppendMenuW(m, MF_STRING | (st == CS_BUSY ? MF_CHECKED : 0), IDM_SESSION, item);
             any = 1;
         }
     }
