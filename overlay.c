@@ -545,7 +545,9 @@ static const char WEB_PAGE[] =
     "for(const s of d.sensors)h+=s.kind=='temp'"
     "?row(esc(s.label),s.value+'\xC2\xB0\x43',temp(s.value)):row(esc(s.label),s.value+' rpm',F);"
     "if(d.claude){const c=d.claude;"
-    "h+='<div class=h>Claude</div>'+row('Sessions',c.busy+' busy / '+c.bg+' bg / '+c.idle+' idle',c.busy?C:I);"
+    "const n=(v,w,col)=>`<span style='color:${col}'>${v} ${w}</span>`;"
+    "h+='<div class=h>Claude</div>'+row('Active '+(c.busy+c.bg),"
+    "n(c.busy,'busy',C)+' / '+(c.bg?n(c.bg,'bg',Y)+' / ':'')+n(c.idle,'idle',I),I);"
     "for(const s of c.sessions){h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
     "s.state=='busy'?C:s.state=='bg'?Y:I);"
     "for(const j of s.jobs||[])h+=`<div class='r j'><span>\xE2\x80\xA2 ${esc(j)}</span></div>`}"
@@ -839,11 +841,32 @@ static void paint(HWND hwnd)
     }
 
     if (s.claude_ok) {
-        if (s.claude_bg)
-            swprintf(buf, 64, L"%d busy / %d bg / %d idle", s.claude_busy, s.claude_bg, s.claude_idle);
-        else
-            swprintf(buf, 64, L"%d busy / %d idle", s.claude_busy, s.claude_idle);
-        draw_row(hdc, row++, L"Claude", buf, s.claude_busy ? CLAUDE_COLOR : IDLE_COLOR);
+        /* "2 busy / 1 bg / 5 idle", each count in its state's colour. */
+        {
+            wchar_t part[3][24];
+            int count[3], st, x = WIN_W - 10, y = PAD + row * LINE_H;
+            SIZE sz;
+            count[CS_IDLE] = s.claude_idle;
+            count[CS_BG] = s.claude_bg;
+            count[CS_BUSY] = s.claude_busy;
+            swprintf(part[0], 24, L"Active %d", s.claude_busy + s.claude_bg);   /* doing something */
+            draw_row(hdc, row++, part[0], L"", IDLE_COLOR);
+            SetTextAlign(hdc, TA_RIGHT);
+            for (st = CS_IDLE; st <= CS_BUSY; st++) {      /* drawn right to left */
+                if (st == CS_BG && !count[CS_BG]) continue;
+                swprintf(part[st], 24, L"%d %s", count[st], CS_NAME[st]);
+                SetTextColor(hdc, CS_COLOR[st]);
+                TextOutW(hdc, x, y, part[st], (int)wcslen(part[st]));
+                GetTextExtentPoint32W(hdc, part[st], (int)wcslen(part[st]), &sz);
+                x -= sz.cx;
+                if (st != CS_BUSY) {
+                    SetTextColor(hdc, IDLE_COLOR);
+                    TextOutW(hdc, x, y, L" / ", 3);
+                    GetTextExtentPoint32W(hdc, L" / ", 3, &sz);
+                    x -= sz.cx;
+                }
+            }
+        }
 
         /* One row per session (busy, then bg, then idle), each followed by
            what it is running. */
