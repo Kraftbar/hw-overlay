@@ -571,7 +571,7 @@ static const char WEB_PAGE[] =
     "if(d.claude){const c=d.claude;"
     "const n=(v,w,col)=>`<span style='color:${col}'>${v} ${w}</span>`;"
     "h+='<div class=h>Claude</div>'+row('Active '+n(c.needs+c.busy+c.bg,'',c.needs+c.busy+c.bg?C:I),"
-    "(c.needs?n(c.needs,'needs you',R)+' / ':'')+n(c.busy,'busy',C)+' / '+(c.bg?n(c.bg,'bg',Y)+' / ':'')+n(c.idle,'idle',I),I);"
+    "c.needs?n(c.needs,'needs you',R):'',I);"
     "for(const s of c.sessions){if(s.state=='idle')continue;h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
     "s.state=='needs you'?R:s.state=='busy'?C:s.state=='bg'?Y:I);"
     "for(const j of s.jobs||[])h+=`<div class='r j'><span>\xE2\x80\xA2 ${esc(j)}</span></div>`}"
@@ -868,40 +868,20 @@ static void paint(HWND hwnd)
     }
 
     if (s.claude_ok) {
-        /* "1 needs you / 2 busy / 1 bg / 5 idle", each count in its state's
-           colour; "needs you" and "bg" only when there are any. */
+        /* "Active N" (how many are doing something, N in orange when > 0) and,
+        on the right, "N needs you" in red when any are waiting on the user. */
         {
-            wchar_t part[CS_COUNT][24];
-            int count[CS_COUNT], st, active, last, x = WIN_W - 10, y = PAD + row * LINE_H;
+            wchar_t num[24];
+            int active = s.claude_needs + s.claude_busy + s.claude_bg, y = PAD + row * LINE_H;
             SIZE sz;
-            count[CS_IDLE] = s.claude_idle;
-            count[CS_BG] = s.claude_bg;
-            count[CS_BUSY] = s.claude_busy;
-            count[CS_NEEDS] = s.claude_needs;
-            last = count[CS_NEEDS] ? CS_NEEDS : CS_BUSY;     /* leftmost part */
-            /* "Active N": how many are doing something, N in orange when > 0 */
-            active = s.claude_needs + s.claude_busy + s.claude_bg;
-            draw_row(hdc, row++, L"Active", L"", IDLE_COLOR);
+            if (s.claude_needs)
+                swprintf(num, 24, L"%d needs you", s.claude_needs);
+            draw_row(hdc, row++, L"Active", s.claude_needs ? num : L"", NEEDS_COLOR);
             GetTextExtentPoint32W(hdc, L"Active ", 7, &sz);
-            swprintf(part[0], 24, L"%d", active);
+            swprintf(num, 24, L"%d", active);
             SetTextColor(hdc, active ? CLAUDE_COLOR : IDLE_COLOR);
             SetTextAlign(hdc, TA_LEFT);
-            TextOutW(hdc, 10 + sz.cx, y, part[0], (int)wcslen(part[0]));
-            SetTextAlign(hdc, TA_RIGHT);
-            for (st = CS_IDLE; st <= last; st++) {         /* drawn right to left */
-                if (st == CS_BG && !count[CS_BG]) continue;
-                swprintf(part[st], 24, L"%d %s", count[st], st == CS_NEEDS ? L"needs" : CS_NAME[st]);
-                SetTextColor(hdc, CS_COLOR[st]);
-                TextOutW(hdc, x, y, part[st], (int)wcslen(part[st]));
-                GetTextExtentPoint32W(hdc, part[st], (int)wcslen(part[st]), &sz);
-                x -= sz.cx;
-                if (st != last) {
-                    SetTextColor(hdc, IDLE_COLOR);
-                    TextOutW(hdc, x, y, L" / ", 3);
-                    GetTextExtentPoint32W(hdc, L" / ", 3, &sz);
-                    x -= sz.cx;
-                }
-            }
+            TextOutW(hdc, 10 + sz.cx, y, num, (int)wcslen(num));
         }
 
         /* One row per active session (busy, then bg), each followed by
