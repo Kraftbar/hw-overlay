@@ -7,6 +7,9 @@
  *   GPU                NVIDIA NVML (nvml.dll ships with the driver)
  *   Claude sessions    state files written by claude-state.ps1 hooks
  *
+ * Phone view: the same stats are served as a web page on the local network,
+ * http://<this PC>:8787 (read-only; the address is shown in the tray menu).
+ *
  * Build:  build.bat   (embeds a "run as administrator" manifest)
  *
  * Hotkeys:  Ctrl+Alt+O  show/hide overlay
@@ -18,8 +21,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <shellapi.h>
 #include <wbemidl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <wchar.h>
 
@@ -36,6 +42,7 @@
 #define IDM_TOGGLE   100
 #define IDM_QUIT     101
 #define IDM_SESSION  102                /* session rows; clicking does nothing */
+#define WEB_PORT     8787
 
 enum { KIND_TEMP = 1, KIND_FAN = 2 };   /* ASUSHW sensor "Type" values */
 
@@ -477,6 +484,200 @@ static DWORD WINAPI sampler(LPVOID unused)
     return 0;
 }
 
+/* ------------------------------------------------------------ phone view */
+
+static char g_web_url[64];              /* "http://192.168.x.x:8787", or empty */
+
+static const char WEB_PAGE[] =
+    "<!doctype html><html><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>hw-overlay</title><style>"
+    "body{margin:0;background:#111;color:#ddd;font:16px/1.4 ui-monospace,Consolas,monospace;padding:12px}"
+    ".r{display:flex;justify-content:space-between;padding:6px 4px;border-bottom:1px solid #222}"
+    ".r span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:12px}"
+    ".v{font-weight:bold;white-space:nowrap}.h{color:#888;font-size:13px;margin:16px 4px 2px}#e{color:#f55;padding:8px 4px}"
+    "</style></head><body><div id=m></div><div id=e></div><script>"
+    "const G='#50e678',Y='#f0d23c',R='#ff5050',F='#78c8ff',C='#e68c5a',I='#969696';"
+    "const load=p=>p<60?G:p<85?Y:R,temp=c=>c<60?G:c<80?Y:R;"
+    "const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));"
+    "const row=(l,v,c)=>`<div class=r><span>${l}</span><span class=v style='color:${c}'>${v}</span></div>`;"
+    "async function tick(){try{"
+    "const d=await(await fetch('data.json',{cache:'no-store'})).json();"
+    "let h=row('CPU',d.cpu.toFixed(1)+' %',load(d.cpu))"
+    "+row('RAM',d.ram_used.toFixed(1)+' / '+d.ram_total.toFixed(1)+' GB',load(d.ram_load));"
+    "if(d.gpu)h+=row('GPU',d.gpu.load+'%  '+d.gpu.temp+'\xC2\xB0\x43  fan '+d.gpu.fan+'%',temp(d.gpu.temp));"
+    "for(const s of d.sensors)h+=s.kind=='temp'"
+    "?row(esc(s.label),s.value+'\xC2\xB0\x43',temp(s.value)):row(esc(s.label),s.value+' rpm',F);"
+    "if(d.claude){const c=d.claude;"
+    "h+='<div class=h>Claude</div>'+row('Sessions',c.busy+' busy / '+c.bg+' bg / '+c.idle+' idle',c.busy?C:I);"
+    "for(const s of c.sessions)h+=row(esc(s.label),s.state+(s.agents?' +'+s.agents:''),"
+    "s.state=='busy'?C:s.state=='bg'?Y:I);"
+    "h+=row('Background',c.background,c.background?C:I);}"
+    "m.innerHTML=h;e.textContent=''}catch(x){e.textContent='PC not reachable'}}"
+    "tick();setInterval(tick,1000)"
+    "</script></body></html>";
+
+typedef struct { char d[16384]; size_t n; } Buf;
+
+static void bprintf(Buf *b, const char *fmt, ...)
+{
+    va_list ap;
+    int r;
+    va_start(ap, fmt);
+    r = vsnprintf(b->d + b->n, sizeof b->d - b->n, fmt, ap);
+    va_end(ap);
+    if (r > 0) b->n += (size_t)r < sizeof b->d - b->n ? (size_t)r : sizeof b->d - b->n - 1;
+}
+
+/* Append a wide string as a JSON string literal (UTF-8, escaped). */
+static void bjson_str(Buf *b, const wchar_t *w)
+{
+    char utf8[512];
+    const unsigned char *p;
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, utf8, sizeof utf8, NULL, NULL);
+    bprintf(b, "\"");
+    for (p = (const unsigned char *)utf8; *p; p++) {
+        if (*p == '"' || *p == '\\') bprintf(b, "\\%c", *p);
+        else if (*p < 0x20) bprintf(b, "\\u%04x", *p);
+        else bprintf(b, "%c", *p);
+    }
+    bprintf(b, "\"");
+}
+
+static void build_json(Buf *b)
+{
+    Snapshot s;
+    int i, st, first;
+
+    EnterCriticalSection(&g_lock);
+    s = g_snap;
+    LeaveCriticalSection(&g_lock);
+
+    b->n = 0;
+    bprintf(b, "{\"cpu\":%.1f,\"ram_used\":%.2f,\"ram_total\":%.2f,\"ram_load\":%lu,",
+            s.cpu, s.mem_used_gb, s.mem_total_gb, s.mem_load);
+    if (s.gpu_ok)
+        bprintf(b, "\"gpu\":{\"load\":%u,\"temp\":%u,\"fan\":%u},", s.gpu_load, s.gpu_temp, s.gpu_fan);
+    else
+        bprintf(b, "\"gpu\":null,");
+
+    bprintf(b, "\"sensors\":[");
+    for (i = 0; i < s.nsens; i++) {
+        bprintf(b, "%s{\"label\":", i ? "," : "");
+        bjson_str(b, s.sens[i].label);
+        bprintf(b, ",\"kind\":\"%s\",\"value\":%d}",
+                s.sens[i].kind == KIND_TEMP ? "temp" : "fan", s.sens[i].value);
+    }
+    bprintf(b, "],");
+
+    if (!s.claude_ok) {
+        bprintf(b, "\"claude\":null}");
+        return;
+    }
+    bprintf(b, "\"claude\":{\"busy\":%d,\"bg\":%d,\"idle\":%d,\"background\":%d,\"sessions\":[",
+            s.claude_busy, s.claude_bg, s.claude_idle, s.claude_agents);
+    first = 1;
+    for (st = CS_BUSY; st >= CS_IDLE; st--) {
+        for (i = 0; i < s.nclaude; i++) {
+            if (s.claude[i].state != st) continue;
+            bprintf(b, "%s{\"label\":", first ? "" : ",");
+            bjson_str(b, s.claude[i].label);
+            bprintf(b, ",\"state\":\"%ls\",\"agents\":%d}", CS_NAME[st], s.claude[i].agents);
+            first = 0;
+        }
+    }
+    bprintf(b, "]}}");
+}
+
+static void web_send(SOCKET c, const char *status, const char *type, const char *body, size_t len)
+{
+    char head[256];
+    int n = snprintf(head, sizeof head,
+                     "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                     status, type, len);
+    send(c, head, n, 0);
+    if (len) send(c, body, (int)len, 0);
+}
+
+/* Find this PC's address on the local network, for the tray menu. */
+static void find_lan_url(void)
+{
+    char host[256];
+    struct addrinfo hints = {0}, *res, *a;
+
+    hints.ai_family = AF_INET;
+    if (gethostname(host, sizeof host) || getaddrinfo(host, NULL, &hints, &res))
+        return;
+    for (a = res; a; a = a->ai_next) {
+        char ip[INET_ADDRSTRLEN];
+        struct sockaddr_in *sin = (struct sockaddr_in *)a->ai_addr;
+        inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof ip);
+        if (strncmp(ip, "127.", 4) == 0 || strncmp(ip, "169.254.", 8) == 0)
+            continue;
+        snprintf(g_web_url, sizeof g_web_url, "http://%s:%d", ip, WEB_PORT);
+        /* Prefer the usual home-network ranges over VPN/virtual adapters. */
+        if (strncmp(ip, "192.168.", 8) == 0 || strncmp(ip, "10.", 3) == 0)
+            break;
+    }
+    freeaddrinfo(res);
+}
+
+/* Tiny read-only HTTP server: "/" is the page, "/data.json" the numbers. */
+static DWORD WINAPI web_server(LPVOID unused)
+{
+    static Buf json;
+    struct sockaddr_in addr = {0};
+    SOCKET srv;
+    WSADATA wsa;
+    (void)unused;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa)) return 0;
+    find_lan_url();
+    srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(WEB_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (srv == INVALID_SOCKET || bind(srv, (struct sockaddr *)&addr, sizeof addr) ||
+        listen(srv, 8)) {
+        g_web_url[0] = 0;
+        WSACleanup();
+        return 0;
+    }
+
+    while (WaitForSingleObject(g_stop, 0) == WAIT_TIMEOUT) {
+        fd_set fds;
+        struct timeval tv = {0, 500000};     /* wake up to check g_stop */
+        SOCKET c;
+        char req[1024];
+        DWORD timeout = 2000;
+        int n;
+
+        FD_ZERO(&fds);
+        FD_SET(srv, &fds);
+        if (select(0, &fds, NULL, NULL, &tv) <= 0) continue;
+        c = accept(srv, NULL, NULL);
+        if (c == INVALID_SOCKET) continue;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof timeout);
+        n = recv(c, req, sizeof req - 1, 0);
+        if (n > 0) {
+            req[n] = 0;
+            if (strncmp(req, "GET /data.json", 14) == 0) {
+                build_json(&json);
+                web_send(c, "200 OK", "application/json", json.d, json.n);
+            } else if (strncmp(req, "GET / ", 6) == 0) {
+                web_send(c, "200 OK", "text/html; charset=utf-8", WEB_PAGE, sizeof WEB_PAGE - 1);
+            } else {
+                web_send(c, "404 Not Found", "text/plain", "", 0);
+            }
+        }
+        closesocket(c);
+    }
+    closesocket(srv);
+    WSACleanup();
+    return 0;
+}
+
 /* ------------------------------------------------------------- drawing */
 
 /* Green below 60%, yellow below 85%, red above. */
@@ -783,6 +984,12 @@ static void tray_menu(HWND hwnd)
     HMENU m = CreatePopupMenu();
     POINT pt;
     add_claude_items(m);
+    if (g_web_url[0]) {
+        wchar_t item[96];
+        swprintf(item, 96, L"Phone: %hs", g_web_url);
+        AppendMenuW(m, MF_STRING | MF_DISABLED, 0, item);
+        AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    }
     AppendMenuW(m, MF_STRING, IDM_TOGGLE,
                 IsWindowVisible(hwnd) ? L"Hide overlay\tCtrl+Alt+O" : L"Show overlay\tCtrl+Alt+O");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -849,7 +1056,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 {
     WNDCLASSW wc = {0};
-    HANDLE thread;
+    HANDLE thread, web;
     MSG msg;
     (void)prev; (void)cmd; (void)show;
 
@@ -896,6 +1103,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
     tray_update(1);
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     thread = CreateThread(NULL, 0, sampler, NULL, 0, NULL);
+    web = CreateThread(NULL, 0, web_server, NULL, 0, NULL);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -904,6 +1112,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
     SetEvent(g_stop);
     WaitForSingleObject(thread, 5000);
+    WaitForSingleObject(web, 2000);
     DeleteObject(g_font);
     return 0;
 }
